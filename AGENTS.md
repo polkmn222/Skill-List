@@ -26,6 +26,7 @@ When the user asks to find relevant skills:
 
 Rules:
 
+- Do not use `find-skills` unless the user explicitly names or asks for `find-skills`.
 - Do not ask the user to run terminal commands manually.
 - Do not require Python or any runtime for normal discovery.
 - Do not install, scaffold, or modify project artifacts until the relevant checklist and index gates are satisfied.
@@ -65,6 +66,7 @@ Codex review behavior:
 
 Review rules:
 
+- Do not use `review-claude` or review agents unless the user explicitly asks for them.
 - Treat all reviewer output as advisory.
 - Verify findings before editing files or reporting them as confirmed.
 - Do not ask reviewers to edit files, commit, push, or run commands.

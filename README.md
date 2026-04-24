@@ -31,6 +31,8 @@ This working copy also includes a shared review helper:
 
 Claude Code has its own plugin path in this project and is not updated by the Cursor/Gemini review entrypoints.
 
+Agents should only use `find-skills`, `review-claude`, or `review-agents` when the user explicitly names or asks for those workflows.
+
 ## Included Skills
 
 Current project-local skills include:
@@ -290,6 +292,8 @@ The check normalizes expected host differences and fails when any shared content
 ## Find Skills Behavior
 
 `find-skills` is the current discovery skill in this repository.
+
+Agents should not use `find-skills` unless the user explicitly names or asks for it.
 
 When using `find-skills`, the agent should:
 
