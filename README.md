@@ -41,8 +41,11 @@ Current project-local skills include:
 | `review-claude` | Run Claude Code as a read-only second-pass reviewer. | Codex, Cursor alias, Gemini alias | Created in this repository by the maintainer. |
 | `review-agents` | Run Claude Code, Codex, or both as read-only reviewers. | Cursor, Gemini | Created in this repository as a host-specific entrypoint to `review-claude`. |
 | `agents-md` | Maintain concise, high-signal agent instruction files. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `architecture` | Evaluate architecture decisions, trade-offs, constraints, and ADR-worthy choices. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `ask-questions-if-underspecified` | Clarify requirements before implementation when meaningful ambiguity remains. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `api-design-principles` | Review REST and GraphQL API design quality. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `brainstorming` | Turn vague feature, architecture, or behavior ideas into a clearer design direction. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `code-review-checklist` | Review changes for functionality, security, performance, tests, and maintainability. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `concise-planning` | Convert coding tasks into clear, actionable checklists. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `create-pr` | Compatibility alias for PR creation workflows. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `frontend-design` | Review and guide frontend UI design and implementation quality. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
@@ -148,8 +151,11 @@ Each host gets one or more self-contained skills:
 .codex/skills/find-skills/SKILL.md
 .codex/skills/review-claude/SKILL.md
 .codex/skills/agents-md/SKILL.md
+.codex/skills/architecture/SKILL.md
+.codex/skills/ask-questions-if-underspecified/SKILL.md
 .codex/skills/api-design-principles/SKILL.md
 .codex/skills/brainstorming/SKILL.md
+.codex/skills/code-review-checklist/SKILL.md
 .codex/skills/concise-planning/SKILL.md
 .codex/skills/create-pr/SKILL.md
 .codex/skills/frontend-design/SKILL.md
