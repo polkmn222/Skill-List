@@ -1,11 +1,13 @@
 ---
 name: find-skills
-description: Use in Codex when the user asks to find relevant Codex skills for a project or idea. Runs a checklist-first workflow, ranks local and external skill candidates, writes a project-local search index, and gates installation or implementation.
+description: Use in Codex only when the user explicitly names find-skills or directly asks to use the find-skills workflow to find relevant Codex skills for a project or idea. Runs a checklist-first workflow, ranks local and external skill candidates, writes a project-local search index, and gates installation or implementation.
 ---
 
 # Find Skills For Codex
 
 Use this skill when the user asks to find, recommend, compare, install, or use Codex skills for a project, project idea, domain, workflow, implementation, or local workspace.
+
+Do not use this skill unless the user explicitly names `find-skills` or directly asks to use the `find-skills` workflow. Do not trigger it merely because the task involves skills, discovery, recommendations, installation, or planning.
 
 This skill is checklist-first. A raw request is not enough to search skill metadata, recommend skills, install skills, or implement artifacts.
 

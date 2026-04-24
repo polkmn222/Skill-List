@@ -1,11 +1,13 @@
 ---
 name: review-agents
-description: Use in Gemini when code changes need a second-pass review from Claude Code, Codex, or both, using the shared project review scripts and cost logging.
+description: Use in Gemini only when the user explicitly asks for review-agents, review-claude, Claude Code review, Codex review, or a second-pass AI review using the shared project review scripts and cost logging.
 ---
 
 # Review Agents
 
 Use this skill when working in Gemini and the user wants another AI reviewer before finalizing changes.
+
+Do not use this skill unless the user explicitly asks for `review-agents`, `review-claude`, Claude Code review, Codex review, or a second-pass AI review. Do not trigger it merely because code changed, tests ran, or a review might be useful.
 
 ## Workflow
 

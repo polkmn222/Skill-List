@@ -1,9 +1,11 @@
 ---
 name: review-claude
-description: Use in Gemini when the user asks for Claude Code review or a Codex/Claude second-pass review; delegates to the shared review-agents scripts.
+description: Use in Gemini only when the user explicitly asks for review-claude, Claude Code review, or a Codex/Claude second-pass review; delegates to the shared review-agents scripts.
 ---
 
 # Review Claude
+
+Do not use this skill unless the user explicitly asks for `review-claude`, Claude Code review, or a Codex/Claude second-pass review. Do not trigger it merely because code changed, tests ran, a review might be useful, or the user asks for a normal Gemini review.
 
 Use `.gemini/skills/review-agents/SKILL.md` for the full workflow.
 

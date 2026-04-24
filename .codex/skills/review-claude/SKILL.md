@@ -1,11 +1,13 @@
 ---
 name: review-claude
-description: Use after Codex has made or inspected code changes and the user wants Claude Code to perform a second-pass, read-only code review using the local claude CLI and ANTHROPIC_API_KEY from .env.
+description: Use only when the user explicitly asks for review-claude, Claude Code review, or a second-pass Claude review after Codex has made or inspected code changes; runs a read-only code review using the local claude CLI and ANTHROPIC_API_KEY from .env.
 ---
 
 # Claude Code Review
 
 Use this skill when the user wants Codex work reviewed by Claude Code, or asks for a second opinion from Claude before finalizing code changes.
+
+Do not use this skill unless the user explicitly asks for `review-claude`, Claude Code review, or a second-pass Claude review. Do not trigger it merely because code changed, tests ran, a review might be useful, or the user asks for a normal Codex review.
 
 ## Workflow
 
