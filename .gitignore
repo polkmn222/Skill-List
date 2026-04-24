@@ -3,3 +3,5 @@
 examples
 docs
 scripts
+.env
+cost.txt
