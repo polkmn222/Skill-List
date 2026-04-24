@@ -35,11 +35,24 @@ Claude Code has its own plugin path in this project and is not updated by the Cu
 
 Current project-local skills include:
 
-| Skill | Purpose | Hosts |
-| --- | --- | --- |
-| `find-skills` | Search, rank, and recommend skills from available `SKILL.md` metadata. | Codex, Claude Code, Cursor, Gemini |
-| `review-claude` | Run Claude Code as a read-only second-pass reviewer. | Codex, Cursor alias, Gemini alias |
-| `review-agents` | Run Claude Code, Codex, or both as read-only reviewers. | Cursor, Gemini |
+| Skill | Purpose | Hosts | Source |
+| --- | --- | --- | --- |
+| `find-skills` | Search, rank, and recommend skills from available `SKILL.md` metadata. | Codex, Claude Code, Cursor, Gemini | Created in this repository by the maintainer. |
+| `review-claude` | Run Claude Code as a read-only second-pass reviewer. | Codex, Cursor alias, Gemini alias | Created in this repository by the maintainer. |
+| `review-agents` | Run Claude Code, Codex, or both as read-only reviewers. | Cursor, Gemini | Created in this repository as a host-specific entrypoint to `review-claude`. |
+| `agents-md` | Maintain concise, high-signal agent instruction files. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `api-design-principles` | Review REST and GraphQL API design quality. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `brainstorming` | Turn vague feature, architecture, or behavior ideas into a clearer design direction. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `concise-planning` | Convert coding tasks into clear, actionable checklists. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `create-pr` | Compatibility alias for PR creation workflows. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `frontend-design` | Review and guide frontend UI design and implementation quality. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `lint-and-validate` | Run appropriate validation after code changes. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `pr-writer` | Write structured pull request descriptions. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `security-auditor` | Review security risks, controls, and mitigations. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `systematic-debugging` | Investigate bugs and test failures before proposing fixes. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `test-driven-development` | Guide feature and bugfix work with a test-first workflow. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+
+The imported Codex skills above were selected from the Antigravity Awesome Skills catalog rather than authored in this repository.
 
 More skills can be added under each host's `.*/skills/<skill-name>/` folder.
 
@@ -134,6 +147,17 @@ Each host gets one or more self-contained skills:
 ```text
 .codex/skills/find-skills/SKILL.md
 .codex/skills/review-claude/SKILL.md
+.codex/skills/agents-md/SKILL.md
+.codex/skills/api-design-principles/SKILL.md
+.codex/skills/brainstorming/SKILL.md
+.codex/skills/concise-planning/SKILL.md
+.codex/skills/create-pr/SKILL.md
+.codex/skills/frontend-design/SKILL.md
+.codex/skills/lint-and-validate/SKILL.md
+.codex/skills/pr-writer/SKILL.md
+.codex/skills/security-auditor/SKILL.md
+.codex/skills/systematic-debugging/SKILL.md
+.codex/skills/test-driven-development/SKILL.md
 .claude/skills/find-skills/SKILL.md
 .cursor/skills/find-skills/SKILL.md
 .cursor/skills/review-agents/SKILL.md
