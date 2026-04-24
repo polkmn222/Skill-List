@@ -42,6 +42,7 @@ Current project-local skills include:
 | `find-skills` | Search, rank, and recommend skills from available `SKILL.md` metadata. | Codex, Claude Code, Cursor, Gemini | Created in this repository by the maintainer. |
 | `review-claude` | Run Claude Code as a read-only second-pass reviewer. | Codex, Cursor alias, Gemini alias | Created in this repository by the maintainer. |
 | `review-agents` | Run Claude Code, Codex, or both as read-only reviewers. | Cursor, Gemini | Created in this repository as a host-specific entrypoint to `review-claude`. |
+| `agent-workflow-docs` | Generate Codex workflow markdown, including `AGENTS.md`, authoring, validation, orchestration, and optional task artifacts. | Codex | Created in this repository by the maintainer. |
 | `agents-md` | Maintain concise, high-signal agent instruction files. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `architecture` | Evaluate architecture decisions, trade-offs, constraints, and ADR-worthy choices. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `ask-questions-if-underspecified` | Clarify requirements before implementation when meaningful ambiguity remains. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
@@ -49,6 +50,7 @@ Current project-local skills include:
 | `brainstorming` | Turn vague feature, architecture, or behavior ideas into a clearer design direction. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `code-review-checklist` | Review changes for functionality, security, performance, tests, and maintainability. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `concise-planning` | Convert coding tasks into clear, actionable checklists. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
+| `create-plan` | Create repository-grounded, harness-aware implementation plans. | Codex | Created in this repository by the maintainer. |
 | `create-pr` | Compatibility alias for PR creation workflows. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `frontend-design` | Review and guide frontend UI design and implementation quality. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
 | `lint-and-validate` | Run appropriate validation after code changes. | Codex | Imported from `https://github.com/sickn33/antigravity-awesome-skills`. |
@@ -68,7 +70,6 @@ These are useful global Codex starter skills to install in `$CODEX_HOME/skills` 
 | Skill | Purpose | Source |
 | --- | --- | --- |
 | `openai-docs` | Use current OpenAI developer documentation for OpenAI API, Codex, Agents SDK, model selection, and upgrade guidance. | `https://github.com/openai/skills/tree/main/skills/.curated/openai-docs` |
-| `create-plan` | Draft concise execution plans for coding tasks before implementation. | `https://github.com/ComposioHQ/awesome-codex-skills/tree/master/create-plan` |
 | `skill-creator` | Scaffold and maintain Codex skills with `SKILL.md`, optional `agents/openai.yaml`, scripts, references, and assets. | `https://github.com/openai/skills/tree/main/skills/.system/skill-creator` |
 | `skill-installer` | Install Codex skills from curated `openai/skills` entries or GitHub repository paths. | `https://github.com/openai/skills/tree/main/skills/.system/skill-installer` |
 | `agents-md` | Create or maintain concise repository instructions for Codex and other coding agents. | `https://github.com/sickn33/antigravity-awesome-skills` |
@@ -157,6 +158,40 @@ Gemini CLI:
 Read `/path/to/Skill-List/.gemini/skills/find-skills/SKILL.md` and find relevant skills for this project.
 ```
 
+## Codex Workflow Docs
+
+Use this prompt in a project that has the Codex skills installed:
+
+```text
+Create Codex workflow markdown for this project.
+Generate code authoring, code validation, and orchestration docs tailored to this repository.
+```
+
+The `agent-workflow-docs` skill creates:
+
+```text
+AGENTS.md
+docs/agent-workflows/code-authoring.md
+docs/agent-workflows/code-validation.md
+docs/agent-workflows/orchestration.md
+```
+
+If task artifacts are requested, it also creates:
+
+```text
+docs/tasks/plan.md
+docs/tasks/phase_001/task.md
+docs/tasks/phase_001/implement.md
+```
+
+Use `create-plan` when a request needs read-only planning, harness awareness, or phased work:
+
+```text
+Use create-plan to produce a phase-based implementation plan.
+```
+
+`create-plan` follows the artifact conventions defined by `agent-workflow-docs`.
+
 ## Installed Files
 
 Each host gets one or more self-contained skills:
@@ -164,6 +199,7 @@ Each host gets one or more self-contained skills:
 ```text
 .codex/skills/find-skills/SKILL.md
 .codex/skills/review-claude/SKILL.md
+.codex/skills/agent-workflow-docs/SKILL.md
 .codex/skills/agents-md/SKILL.md
 .codex/skills/architecture/SKILL.md
 .codex/skills/ask-questions-if-underspecified/SKILL.md
@@ -171,6 +207,7 @@ Each host gets one or more self-contained skills:
 .codex/skills/brainstorming/SKILL.md
 .codex/skills/code-review-checklist/SKILL.md
 .codex/skills/concise-planning/SKILL.md
+.codex/skills/create-plan/SKILL.md
 .codex/skills/create-pr/SKILL.md
 .codex/skills/frontend-design/SKILL.md
 .codex/skills/lint-and-validate/SKILL.md

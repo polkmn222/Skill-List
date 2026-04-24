@@ -31,6 +31,7 @@ Useful modes:
 .codex/skills/review-claude/scripts/review-with-claude.sh --staged
 .codex/skills/review-claude/scripts/review-with-claude.sh --base origin/main
 .codex/skills/review-claude/scripts/review-with-claude.sh --output .codex/skills/review-claude/reports/latest.md
+.codex/skills/review-claude/scripts/review-with-claude.sh --model opus
 ```
 
 Run Claude Code, Codex, or both through the shared wrapper:
@@ -51,9 +52,20 @@ The script loads `.env` when present. It expects `ANTHROPIC_API_KEY` to be avail
 
 By default it uses:
 
-- model: `sonnet`
+- model: `sonnet`, which is the Claude Code alias for the latest Sonnet model available to the local Claude Code account
 - per-run budget cap: `$0.25`
 - cost log: `cost.txt` at the project root
+
+If the user explicitly asks to use Opus, pass `--model opus` or set
+`CLAUDE_REVIEW_MODEL=opus`. The Claude Code `opus` alias is used instead of a
+dated model id so the local Claude Code CLI can route to the current Opus model
+available for the account.
+
+Cost entries are read from Claude Code's JSON response fields, preferring
+`total_cost_usd` and falling back to `cost_usd`. If neither field is present,
+the script records `cost_usd=unavailable` instead of estimating cost.
+The cost log is rewritten newest-first on each run and includes a top-level
+`total_cost_usd` summary across entries with available cost data.
 
 Override when needed:
 
@@ -64,6 +76,23 @@ CLAUDE_REVIEW_COST_FILE=.codex/skills/review-claude/reports/cost.txt .codex/skil
 ```
 
 Codex reviews use the local `codex` CLI. Codex cost is not logged by this project script because the CLI does not expose the same per-run `total_cost_usd` field used by Claude Code.
+
+## Evaluation
+
+Use the project evaluation docs when changing this skill:
+
+```bash
+CLAUDE_REVIEW_TIMEOUT_SECONDS=300 .codex/skills/review-claude/scripts/smoke-test-claude-review.sh
+CLAUDE_REVIEW_TIMEOUT_SECONDS=300 docs/skill-eval/review-claude-seeded-bug.sh
+```
+
+Expected seeded bug coverage:
+
+- overly broad authorization from truthy roles
+- raw token return from masking helpers
+- raw token logging
+
+Treat evaluation failures as skill regressions unless the evaluation fixture is intentionally updated.
 
 ## Review Policy
 

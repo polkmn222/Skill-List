@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  review-with-agents.sh [--engine claude|codex|both] [--staged] [--base <ref>] [--output-dir <dir>] [--context <text>] [--help]
+  review-with-agents.sh [--engine claude|codex|both] [--staged] [--base <ref>] [--output-dir <dir>] [--context <text>] [--model <name>] [--help]
 
 Options:
   --engine <name>   Reviewer to run: claude, codex, or both. Default: both
@@ -13,6 +13,8 @@ Options:
   --output-dir <d>  Directory for review reports.
                     Default: .codex/skills/review-claude/reports
   --context <text>  Add short task or test context.
+  --model <name>    Claude Code model alias/name for Claude reviews.
+                    Default: sonnet. Use opus when the user explicitly asks for Opus.
   --help            Show this help.
 USAGE
 }
@@ -22,6 +24,7 @@ engine="both"
 output_dir=".codex/skills/review-claude/reports"
 context=""
 mode_args=()
+claude_model_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +60,14 @@ while [[ $# -gt 0 ]]; do
       context="${2:-}"
       shift 2
       ;;
+    --model)
+      if [[ -z "${2:-}" ]]; then
+        echo "Missing value for --model" >&2
+        exit 2
+      fi
+      claude_model_args+=(--model "$2")
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -75,6 +86,7 @@ mkdir -p "$output_dir"
 run_claude() {
   "$script_dir/review-with-claude.sh" \
     "${mode_args[@]}" \
+    "${claude_model_args[@]}" \
     --output "$output_dir/claude-review-${timestamp}.md" \
     --context "$context"
 }

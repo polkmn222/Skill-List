@@ -100,6 +100,24 @@ Write the index under the current project root:
 
 The index must cite the checklist path and rank candidates from checklist contents, not from the raw request alone. It must make installation easy and use project-relative skill paths when installed.
 
+## Evaluation
+
+When changing this skill, update or rerun the project-local evaluation notes in:
+
+```text
+docs/skill-eval/find-skills.md
+```
+
+Use the recorded golden prompts to check:
+
+- trigger accuracy: the skill activates only when explicitly named or directly requested
+- checklist discipline: no candidate search before checklist completion and confirmation
+- ranking quality: expected `Precise`, `Balanced`, and `Recall` candidates appear in the correct buckets
+- traceability: scores and recommendations cite checklist-derived requirements
+- gate safety: installation or implementation remains blocked until the index is confirmed
+
+If a live transcript benchmark is run, save checklist paths, index paths, top candidates, gate decisions, and limitations under `docs/skill-eval/reports/`.
+
 ## Failure And Limit Handling
 
 - If filesystem writes are unavailable, show the intended checklist or index in chat and state that it could not be written.

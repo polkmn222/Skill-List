@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  review-with-claude.sh [--staged] [--base <ref>] [--output <file>] [--context <text>] [--help]
+  review-with-claude.sh [--staged] [--base <ref>] [--output <file>] [--context <text>] [--model <name>] [--help]
 
 Options:
   --staged          Review staged changes with git diff --cached.
@@ -12,6 +12,8 @@ Options:
   --output <file>   Write the Claude review to this file.
                     Default: .codex/skills/review-claude/reports/review-<timestamp>.md
   --context <text>  Add short task or test context to the review prompt.
+  --model <name>    Claude Code model alias/name. Default: sonnet.
+                    Use opus when the user explicitly asks for Opus.
   --help            Show this help.
 
 Default mode reviews unstaged and staged working tree changes with git diff HEAD.
@@ -27,6 +29,7 @@ USAGE
 mode="head"
 base_ref=""
 extra_context=""
+model_override=""
 timestamp="$(date +%Y%m%d-%H%M%S)"
 output=".codex/skills/review-claude/reports/review-${timestamp}.md"
 
@@ -55,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --context)
       extra_context="${2:-}"
+      shift 2
+      ;;
+    --model)
+      model_override="${2:-}"
+      if [[ -z "$model_override" ]]; then
+        echo "Missing value for --model" >&2
+        exit 2
+      fi
       shift 2
       ;;
     --help|-h)
@@ -156,7 +167,7 @@ PROMPT
 
 timeout_seconds="${CLAUDE_REVIEW_TIMEOUT_SECONDS:-120}"
 max_budget_usd="${CLAUDE_REVIEW_MAX_BUDGET_USD:-0.25}"
-model="${CLAUDE_REVIEW_MODEL:-sonnet}"
+model="${model_override:-${CLAUDE_REVIEW_MODEL:-sonnet}}"
 cost_file="${CLAUDE_REVIEW_COST_FILE:-cost.txt}"
 
 claude_args=(
@@ -169,6 +180,8 @@ claude_args=(
   --tools ""
   --max-budget-usd "$max_budget_usd"
 )
+
+started_at="$(date +%s)"
 
 claude "${claude_args[@]}" < "$tmp_prompt" > "$tmp_response" &
 claude_pid=$!
@@ -186,10 +199,12 @@ while kill -0 "$claude_pid" >/dev/null 2>&1; do
 done
 
 wait "$claude_pid"
+finished_at="$(date +%s)"
+elapsed_seconds=$((finished_at - started_at))
 
-node - "$tmp_response" "$output" "$cost_file" "$model" "$diff_label" <<'NODE'
+node - "$tmp_response" "$output" "$cost_file" "$model" "$diff_label" "$elapsed_seconds" "$max_budget_usd" <<'NODE'
 const fs = require("fs");
-const [responsePath, outputPath, costPath, model, scope] = process.argv.slice(2);
+const [responsePath, outputPath, costPath, model, scope, elapsedSeconds, maxBudgetUsd] = process.argv.slice(2);
 
 const raw = fs.readFileSync(responsePath, "utf8");
 let payload;
@@ -203,21 +218,45 @@ try {
 const result = payload.result || payload.response || payload.message || raw;
 fs.writeFileSync(outputPath, `${result}`.trimEnd() + "\n");
 
-const costValue = Number(payload.total_cost_usd ?? payload.cost_usd ?? 0);
-const cost = Number.isFinite(costValue) ? costValue : 0;
+const costField = payload.total_cost_usd !== undefined ? "total_cost_usd" : payload.cost_usd !== undefined ? "cost_usd" : "missing";
+const costValue = Number(payload.total_cost_usd ?? payload.cost_usd);
+const cost = Number.isFinite(costValue) ? `$${costValue.toFixed(6)}` : "unavailable";
 const timestamp = new Date().toISOString();
 const line = [
   timestamp,
   `model=${model}`,
   `scope=${scope}`,
-  `cost_usd=$${cost.toFixed(6)}`,
+  `cost_usd=${cost}`,
+  `cost_source=claude_json.${costField}`,
+  `budget_usd=$${Number(maxBudgetUsd).toFixed(2)}`,
+  `elapsed_seconds=${elapsedSeconds}`,
   `output=${outputPath}`
 ].join(" | ");
 
-if (!fs.existsSync(costPath)) {
-  fs.writeFileSync(costPath, "# Claude Code review cost log\n# timestamp | model | scope | cost_usd | output\n");
+let existingEntries = [];
+if (fs.existsSync(costPath)) {
+  existingEntries = fs
+    .readFileSync(costPath, "utf8")
+    .split(/\r?\n/)
+    .filter((existingLine) => /^\d{4}-\d{2}-\d{2}T/.test(existingLine));
 }
-fs.appendFileSync(costPath, `${line}\n`);
+
+const entries = [line, ...existingEntries];
+let totalCost = 0;
+let unavailableCount = 0;
+
+for (const entry of entries) {
+  const match = entry.match(/cost_usd=\$([0-9]+(?:\.[0-9]+)?)/);
+  if (match) {
+    totalCost += Number(match[1]);
+  } else if (entry.includes("cost_usd=unavailable")) {
+    unavailableCount += 1;
+  }
+}
+
+const summary = `# total_cost_usd=$${totalCost.toFixed(6)} | entries=${entries.length} | unavailable_cost_entries=${unavailableCount}`;
+const header = "# timestamp | model | scope | cost_usd | cost_source | budget_usd | elapsed_seconds | output";
+fs.writeFileSync(costPath, `# Claude Code review cost log\n${summary}\n${header}\n${entries.join("\n")}\n`);
 NODE
 
 echo "Claude review written to $output"
