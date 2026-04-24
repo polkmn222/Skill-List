@@ -59,6 +59,18 @@ The imported Codex skills above were selected from the Antigravity Awesome Skill
 
 More skills can be added under each host's `.*/skills/<skill-name>/` folder.
 
+## Recommended Codex Starter Skills
+
+These are useful global Codex starter skills to install in `$CODEX_HOME/skills` (`~/.codex/skills` by default). Restart Codex after installing or updating skills so Codex reloads the metadata.
+
+| Skill | Purpose | Source |
+| --- | --- | --- |
+| `openai-docs` | Use current OpenAI developer documentation for OpenAI API, Codex, Agents SDK, model selection, and upgrade guidance. | `https://github.com/openai/skills/tree/main/skills/.curated/openai-docs` |
+| `create-plan` | Draft concise execution plans for coding tasks before implementation. | `https://github.com/ComposioHQ/awesome-codex-skills/tree/master/create-plan` |
+| `skill-creator` | Scaffold and maintain Codex skills with `SKILL.md`, optional `agents/openai.yaml`, scripts, references, and assets. | `https://github.com/openai/skills/tree/main/skills/.system/skill-creator` |
+| `skill-installer` | Install Codex skills from curated `openai/skills` entries or GitHub repository paths. | `https://github.com/openai/skills/tree/main/skills/.system/skill-installer` |
+| `agents-md` | Create or maintain concise repository instructions for Codex and other coding agents. | `https://github.com/sickn33/antigravity-awesome-skills` |
+
 ## Install
 
 Install for Codex CLI:
