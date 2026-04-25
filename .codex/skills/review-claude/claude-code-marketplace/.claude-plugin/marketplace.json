@@ -1,0 +1,21 @@
+{
+  "name": "local-review-tools",
+  "owner": {
+    "name": "Local Workspace"
+  },
+  "metadata": {
+    "description": "Local Claude Code plugins for background review workflows.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "review-claude",
+      "description": "Submit asynchronous read-only Claude review jobs and collect their results.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Local Workspace"
+      },
+      "source": "./plugins/review-claude-plugin"
+    }
+  ]
+}

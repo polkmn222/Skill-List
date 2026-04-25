@@ -1,0 +1,750 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  claude-review-worker.sh <job-dir> <job-id> [--model <name>] [--claude-bin <path>] [--max-budget-usd <amount>] [--timeout-seconds <seconds>] [--notify 0|1] [--env-file <file>] [--delete-env-file-after-read] [--always-exit-zero] [--launchctl-label <label>] [--summary-dir <dir>] [--session-arg <arg>]...
+
+Internal worker for review-claude. Codex creates prompt.txt and diff.patch,
+starts this script in the background, then stops waiting.
+USAGE
+}
+
+job_dir="${1:-}"
+job_id="${2:-}"
+if [[ -z "$job_dir" || -z "$job_id" ]]; then
+  usage >&2
+  exit 2
+fi
+shift 2
+
+umask 077
+
+model="sonnet"
+claude_bin="${CLAUDE_REVIEW_CLAUDE_BIN:-claude}"
+max_budget_usd="${CLAUDE_REVIEW_MAX_BUDGET_USD:-0.25}"
+timeout_seconds="${CLAUDE_REVIEW_TIMEOUT_SECONDS:-120}"
+notify="${CLAUDE_REVIEW_NOTIFY:-1}"
+session_args=(--no-session-persistence)
+env_file=""
+delete_env_file_after_read=0
+always_exit_zero=0
+launchctl_label=""
+summary_dir="${CLAUDE_REVIEW_SUMMARY_DIR:-}"
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+load_anthropic_key_from_env_file() {
+  local file_path="$1"
+  local line key value first_char last_char
+
+  [[ -z "${ANTHROPIC_API_KEY:-}" ]] || return 0
+  [[ -r "$file_path" ]] || return 13
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim_whitespace "$line")"
+
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="$(trim_whitespace "$line")"
+    fi
+
+    [[ "$line" == *=* ]] || continue
+
+    key="$(trim_whitespace "${line%%=*}")"
+    value="$(trim_whitespace "${line#*=}")"
+
+    [[ "$key" == "ANTHROPIC_API_KEY" ]] || continue
+
+    if [[ "${#value}" -ge 2 ]]; then
+      first_char="${value:0:1}"
+      last_char="${value: -1}"
+      if [[ "$first_char" == "$last_char" && ( "$first_char" == "\"" || "$first_char" == "'" ) ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    ANTHROPIC_API_KEY="$value"
+    export ANTHROPIC_API_KEY
+    return 0
+  done < "$file_path"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      model="${2:-}"
+      if [[ -z "$model" ]]; then
+        echo "Missing value for --model" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --claude-bin)
+      claude_bin="${2:-}"
+      if [[ -z "$claude_bin" ]]; then
+        echo "Missing value for --claude-bin" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --max-budget-usd)
+      max_budget_usd="${2:-}"
+      if [[ -z "$max_budget_usd" ]]; then
+        echo "Missing value for --max-budget-usd" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --timeout-seconds)
+      timeout_seconds="${2:-}"
+      if [[ -z "$timeout_seconds" ]]; then
+        echo "Missing value for --timeout-seconds" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --notify)
+      notify="${2:-}"
+      if [[ -z "$notify" ]]; then
+        echo "Missing value for --notify" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --env-file)
+      env_file="${2:-}"
+      if [[ -z "$env_file" ]]; then
+        echo "Missing value for --env-file" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --delete-env-file-after-read)
+      delete_env_file_after_read=1
+      shift
+      ;;
+    --always-exit-zero)
+      always_exit_zero=1
+      shift
+      ;;
+    --launchctl-label)
+      launchctl_label="${2:-}"
+      if [[ -z "$launchctl_label" ]]; then
+        echo "Missing value for --launchctl-label" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --summary-dir)
+      summary_dir="${2:-}"
+      if [[ -z "$summary_dir" ]]; then
+        echo "Missing value for --summary-dir" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --session-arg)
+      if [[ -z "${2:-}" ]]; then
+        echo "Missing value for --session-arg" >&2
+        exit 2
+      fi
+      if [[ "${#session_args[@]}" -eq 1 && "${session_args[0]}" == "--no-session-persistence" ]]; then
+        session_args=()
+      fi
+      session_args+=("$2")
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "$job_dir"
+
+response_path="${job_dir}/response.json"
+stderr_path="${job_dir}/stderr.log"
+worker_log_path="${job_dir}/worker.log"
+prompt_path="${job_dir}/prompt.txt"
+finalized=0
+
+remove_launchctl_job() {
+  [[ -n "$launchctl_label" ]] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  launchctl remove "$launchctl_label" >> "${job_dir}/launchctl_remove.log" 2>&1 || true
+}
+
+if [[ -f "${job_dir}/finished_at" || ( -s "$worker_log_path" && -s "$response_path" ) ]]; then
+  remove_launchctl_job
+  exit 0
+fi
+
+write_fallback_status() {
+  local exit_code="${1:-1}"
+  local reason="${2:-unexpected_exit}"
+
+  set +e
+
+  [[ "$finalized" -eq 1 ]] && return 0
+  [[ -f "${job_dir}/exit_code" ]] && return 0
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    exit_code=1
+  fi
+
+  printf '%s\n' "$exit_code" > "${job_dir}/exit_code"
+  printf 'failed\n' > "${job_dir}/status"
+  date +%s > "${job_dir}/finished_at"
+
+  if [[ ! -s "$stderr_path" ]]; then
+    printf 'Claude review worker stopped before writing a normal result (%s).\n' "$reason" > "$stderr_path"
+  fi
+
+  if [[ ! -s "$worker_log_path" ]]; then
+    {
+      printf 'job_id=%s\n' "$job_id"
+      printf 'model=%s\n' "$model"
+      printf 'max_budget_usd=%s\n' "$max_budget_usd"
+      printf 'claude_exit=%s\n' "$exit_code"
+      printf 'fallback_reason=%s\n' "$reason"
+    } > "$worker_log_path"
+  fi
+
+  if declare -F write_notification >/dev/null 2>&1; then
+    write_notification "failed" "$exit_code" || true
+  else
+    {
+      printf 'Claude review failed\n'
+      printf 'Job %s exited with %s before writing a normal result.\n' "$job_id" "$exit_code"
+    } > "${job_dir}/notification.txt"
+    printf 'fallback\n' > "${job_dir}/notification_status"
+    printf '0\n' > "${job_dir}/notification_exit_code"
+  fi
+
+  if declare -F write_summary_mirror >/dev/null 2>&1; then
+    write_summary_mirror "$exit_code" "failed" || true
+  fi
+
+  remove_launchctl_job || true
+}
+
+handle_unexpected_exit() {
+  local exit_code="$1"
+  write_fallback_status "$exit_code" "unexpected_exit"
+}
+
+handle_signal() {
+  local signal_name="$1"
+  local exit_code="$2"
+
+  write_fallback_status "$exit_code" "signal_${signal_name}"
+  exit "$exit_code"
+}
+
+trap 'handle_unexpected_exit "$?"' EXIT
+trap 'handle_signal HUP 129' HUP
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+
+write_notification_mirror() {
+  local latest_tmp
+
+  [[ -n "$summary_dir" ]] || return 0
+
+  if [[ -f "${job_dir}/notification.txt" ]]; then
+    latest_tmp="${summary_dir%/}/latest_notification.txt.tmp.$$"
+    {
+      printf 'job_id=%s\n' "$job_id"
+      printf 'job_dir=%s\n' "$job_dir"
+      if [[ -f "${job_dir}/status" ]]; then
+        printf 'status=%s\n' "$(cat "${job_dir}/status")"
+      fi
+      if [[ -f "${job_dir}/exit_code" ]]; then
+        printf 'exit_code=%s\n' "$(cat "${job_dir}/exit_code")"
+      fi
+      if [[ -f "${job_dir}/notification_status" ]]; then
+        printf 'notification_status=%s\n' "$(cat "${job_dir}/notification_status")"
+      fi
+      if [[ -f "${job_dir}/notification_exit_code" ]]; then
+        printf 'notification_exit_code=%s\n' "$(cat "${job_dir}/notification_exit_code")"
+      fi
+      printf '\n'
+      cat "${job_dir}/notification.txt"
+    } > "$latest_tmp"
+    mv "$latest_tmp" "${summary_dir%/}/latest_notification.txt" 2>/dev/null || rm -f "$latest_tmp" 2>/dev/null || true
+  fi
+}
+
+write_notification() {
+  local status="$1"
+  local exit_code="$2"
+  local title message notification_error
+
+  if [[ "$status" == "complete" ]]; then
+    title="Claude review complete"
+    message="Job ${job_id} is ready. Ask Codex: collect review-claude job ${job_id}"
+  else
+    title="Claude review failed"
+    message="Job ${job_id} exited with ${exit_code}. Ask Codex to collect it for stderr."
+  fi
+
+  {
+    printf '%s\n' "$title"
+    printf '%s\n' "$message"
+  } > "${job_dir}/notification.txt"
+
+  case "$notify" in
+    0|false|FALSE|no|NO)
+      printf 'skipped\n' > "${job_dir}/notification_status"
+      printf '0\n' > "${job_dir}/notification_exit_code"
+      write_notification_mirror
+      return 0
+      ;;
+  esac
+
+  if ! command -v osascript >/dev/null 2>&1; then
+    printf 'osascript_not_found\n' > "${job_dir}/notification_status"
+    printf '127\n' > "${job_dir}/notification_exit_code"
+    write_notification_mirror
+    return 0
+  fi
+
+  notification_error="${job_dir}/notification_error.log"
+  set +e
+  osascript \
+    -e "on run argv" \
+    -e "display notification (item 2 of argv) with title (item 1 of argv)" \
+    -e "end run" \
+    "$title" "$message" > "${job_dir}/notification_stdout.log" 2> "$notification_error"
+  local notify_exit=$?
+  set -e
+
+  printf '%s\n' "$notify_exit" > "${job_dir}/notification_exit_code"
+  if [[ "$notify_exit" -eq 0 ]]; then
+    printf 'attempted\n' > "${job_dir}/notification_status"
+  else
+    printf 'failed\n' > "${job_dir}/notification_status"
+  fi
+  write_notification_mirror
+}
+
+copy_if_exists() {
+  local source_path="$1"
+  local dest_path="$2"
+
+  if [[ -f "$source_path" ]]; then
+    cp "$source_path" "$dest_path"
+  fi
+}
+
+find_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '%s\n' /usr/bin/python3
+    return 0
+  fi
+
+  return 1
+}
+
+print_response_body() {
+  local response_file="$1"
+
+  if command -v node >/dev/null 2>&1; then
+    if node -e 'const fs=require("fs"); const raw=fs.readFileSync(process.argv[1],"utf8"); const payload=JSON.parse(raw); let candidate=raw; if (payload && typeof payload==="object" && !Array.isArray(payload)) { candidate=payload.result ?? payload.response ?? payload.message ?? raw; } if (typeof candidate==="object") { process.stdout.write(JSON.stringify(candidate, null, 2)); } else { process.stdout.write(String(candidate).trimEnd()); } process.stdout.write("\n");' "$response_file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$response_file" <<'PY' 2>/dev/null
+import json
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8").read()
+payload = json.loads(raw)
+candidate = raw
+if isinstance(payload, dict):
+    candidate = payload.get("result") or payload.get("response") or payload.get("message") or raw
+if isinstance(candidate, (dict, list)):
+    sys.stdout.write(json.dumps(candidate, indent=2))
+else:
+    sys.stdout.write(str(candidate).rstrip())
+sys.stdout.write("\n")
+PY
+    then
+      return 0
+    fi
+  fi
+
+  if [[ -x /usr/bin/python3 ]]; then
+    if /usr/bin/python3 - "$response_file" <<'PY' 2>/dev/null
+import json
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8").read()
+payload = json.loads(raw)
+candidate = raw
+if isinstance(payload, dict):
+    candidate = payload.get("result") or payload.get("response") or payload.get("message") or raw
+if isinstance(candidate, (dict, list)):
+    sys.stdout.write(json.dumps(candidate, indent=2))
+else:
+    sys.stdout.write(str(candidate).rstrip())
+sys.stdout.write("\n")
+PY
+    then
+      return 0
+    fi
+  fi
+
+	  sed -n '1,120p' "$response_file"
+}
+
+write_latest_index() {
+  local exit_code="$1"
+  local status="$2"
+  local index_path tmp_path python_bin
+
+  [[ -n "$summary_dir" ]] || return 0
+
+  index_path="${summary_dir%/}/latest_job_id.txt"
+  tmp_path="${summary_dir%/}/latest_job_id.txt.tmp.$$"
+  python_bin="$(find_python || true)"
+
+  if [[ -n "$python_bin" ]]; then
+    if "$python_bin" - "$index_path" "$tmp_path" "$job_id" "$status" "$exit_code" "$job_dir" "$response_path" <<'PY'
+import json
+import os
+import sys
+
+index_path, tmp_path, job_id, status, exit_code, job_dir, response_path = sys.argv[1:8]
+
+try:
+    exit_value = int(exit_code)
+except ValueError:
+    exit_value = exit_code
+
+record = {
+    "job_id": job_id,
+    "status": status,
+    "exit_code": exit_value,
+    "job_dir": job_dir,
+}
+
+if os.path.exists(response_path) and os.path.getsize(response_path) > 0:
+    raw = open(response_path, encoding="utf-8").read()
+    try:
+        response = json.loads(raw)
+        record["response"] = response
+        record["cost_usd"] = response.get("total_cost_usd")
+        record["duration_ms"] = response.get("duration_ms")
+        record["session_id"] = response.get("session_id")
+    except json.JSONDecodeError:
+        record["response_raw"] = raw
+
+def line_job_id(line):
+    line = line.strip()
+    if not line:
+        return ""
+    if line.startswith("{"):
+        try:
+            payload = json.loads(line)
+            return str(payload.get("job_id", ""))
+        except json.JSONDecodeError:
+            return ""
+    return line
+
+with open(tmp_path, "w", encoding="utf-8") as out:
+    out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as source:
+            for existing in source:
+                if line_job_id(existing) == job_id:
+                    continue
+                if existing.strip():
+                    out.write(existing if existing.endswith("\n") else existing + "\n")
+
+os.replace(tmp_path, index_path)
+PY
+    then
+      return 0
+    fi
+    rm -f "$tmp_path" 2>/dev/null || true
+    return 0
+  fi
+
+  {
+    printf '{"job_id":"%s","status":"%s","exit_code":"%s","job_dir":"%s"}\n' "$job_id" "$status" "$exit_code" "$job_dir"
+    if [[ -f "$index_path" ]]; then
+      sed "/$job_id/d" "$index_path"
+    fi
+  } > "$tmp_path"
+  mv "$tmp_path" "$index_path"
+}
+
+write_cost_log() {
+  local exit_code="$1"
+  local status="$2"
+  local cost_path tmp_path python_bin finished_at
+
+  [[ -n "$summary_dir" ]] || return 0
+  [[ -s "$response_path" ]] || return 0
+
+  cost_path="${summary_dir%/}/cost.txt"
+  tmp_path="${summary_dir%/}/cost.txt.tmp.$$"
+  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python_bin="$(find_python || true)"
+
+  if [[ -n "$python_bin" ]]; then
+    if "$python_bin" - "$cost_path" "$tmp_path" "$job_id" "$status" "$exit_code" "$model" "$max_budget_usd" "$finished_at" "$response_path" <<'PY'
+import json
+import os
+import sys
+
+cost_path, tmp_path, job_id, status, exit_code, model, budget, finished_at, response_path = sys.argv[1:10]
+
+try:
+    response = json.load(open(response_path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    response = {}
+
+try:
+    exit_value = int(exit_code)
+except ValueError:
+    exit_value = exit_code
+
+cost = response.get("total_cost_usd")
+source = "claude_json.total_cost_usd" if cost is not None else "unavailable"
+duration_ms = response.get("duration_ms")
+session_id = response.get("session_id")
+
+record = {
+    "timestamp": finished_at,
+    "job_id": job_id,
+    "status": status,
+    "exit_code": exit_value,
+    "model": model,
+    "cost_usd": cost,
+    "cost_source": source,
+    "budget_usd": budget,
+    "duration_ms": duration_ms,
+    "session_id": session_id,
+}
+
+def load_existing_records(path):
+    records = []
+    if not os.path.exists(path):
+        return records
+    with open(path, encoding="utf-8") as source_file:
+        for existing in source_file:
+            stripped = existing.strip()
+            if not stripped or not stripped.startswith("{"):
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("job_id", "")) == job_id:
+                continue
+            records.append(payload)
+    return records
+
+def write_cost_file(path, records):
+    total = 0.0
+    unavailable = 0
+    for payload in records:
+        value = payload.get("cost_usd")
+        if isinstance(value, (int, float)):
+            total += float(value)
+        else:
+            unavailable += 1
+    with open(path, "w", encoding="utf-8") as out:
+        out.write("# Claude Code review cost log\n")
+        out.write(
+            f"# total_cost_usd=${total:.6f} | entries={len(records)} | "
+            f"unavailable_cost_entries={unavailable}\n"
+        )
+        for payload in records:
+            out.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+write_cost_file(tmp_path, [record] + load_existing_records(cost_path))
+
+os.replace(tmp_path, cost_path)
+PY
+    then
+      return 0
+    fi
+    rm -f "$tmp_path" 2>/dev/null || true
+    return 0
+  fi
+}
+
+write_summary_mirror() {
+  local exit_code="$1"
+  local status="$2"
+
+  [[ -n "$summary_dir" ]] || return 0
+
+  write_latest_index "$exit_code" "$status"
+  write_cost_log "$exit_code" "$status"
+}
+
+finish() {
+  local exit_code="$1"
+  local status="failed"
+
+  [[ "$exit_code" -eq 0 ]] && status="complete"
+
+  printf '%s\n' "$exit_code" > "${job_dir}/exit_code"
+  printf '%s\n' "$status" > "${job_dir}/status"
+  date +%s > "${job_dir}/finished_at"
+  write_notification "$status" "$exit_code"
+  write_summary_mirror "$exit_code" "$status" || true
+  remove_launchctl_job
+  finalized=1
+}
+
+if [[ -n "$env_file" ]]; then
+  if ! load_anthropic_key_from_env_file "$env_file"; then
+    printf 'Could not read env file: %s\n' "$env_file" > "$stderr_path"
+    finish 13
+    if [[ "$always_exit_zero" -eq 1 ]]; then
+      exit 0
+    fi
+    exit 13
+  fi
+  if [[ "$delete_env_file_after_read" -eq 1 ]]; then
+    rm -f "$env_file"
+  fi
+fi
+
+if [[ ! -s "$prompt_path" ]]; then
+  printf 'prompt.txt is missing or empty.\n' > "$stderr_path"
+  finish 2
+  if [[ "$always_exit_zero" -eq 1 ]]; then
+    exit 0
+  fi
+  exit 2
+fi
+
+if [[ "$claude_bin" != */* ]] && ! command -v "$claude_bin" >/dev/null 2>&1; then
+  printf 'claude CLI was not found on PATH.\n' > "$stderr_path"
+  finish 127
+  if [[ "$always_exit_zero" -eq 1 ]]; then
+    exit 0
+  fi
+  exit 127
+elif [[ "$claude_bin" == */* && ! -x "$claude_bin" ]]; then
+  printf 'claude CLI is not executable: %s\n' "$claude_bin" > "$stderr_path"
+  finish 127
+  if [[ "$always_exit_zero" -eq 1 ]]; then
+    exit 0
+  fi
+  exit 127
+fi
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  printf 'ANTHROPIC_API_KEY is not set.\n' > "$stderr_path"
+  finish 1
+  if [[ "$always_exit_zero" -eq 1 ]]; then
+    exit 0
+  fi
+  exit 1
+fi
+
+printf '%s\n' "$$" > "${job_dir}/worker_pid"
+date +%s > "${job_dir}/started_at"
+printf '%s\n' "$model" > "${job_dir}/model"
+printf '%s\n' "$max_budget_usd" > "${job_dir}/max_budget_usd"
+printf '%s\n' "$timeout_seconds" > "${job_dir}/timeout_seconds"
+
+claude_args=(
+  "$claude_bin" --bare --print
+  --model "$model"
+  --output-format json
+  --permission-mode dontAsk
+  --tools ""
+  --max-budget-usd "$max_budget_usd"
+  "${session_args[@]}"
+)
+
+set +e
+python_bin="$(find_python)"
+if [[ -n "$python_bin" ]]; then
+  "$python_bin" - "$timeout_seconds" "$prompt_path" "$response_path" "$stderr_path" "${claude_args[@]}" <<'PY'
+import subprocess
+import sys
+
+timeout_seconds = float(sys.argv[1])
+prompt_path, response_path, stderr_path = sys.argv[2:5]
+command = sys.argv[5:]
+
+with open(prompt_path, "rb") as stdin:
+    with open(response_path, "wb") as stdout:
+        with open(stderr_path, "wb") as stderr:
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+                sys.exit(completed.returncode)
+            except subprocess.TimeoutExpired:
+                stderr.write(
+                    f"Claude review timed out after {timeout_seconds:g}s.\n".encode("utf-8")
+                )
+                sys.exit(124)
+PY
+  claude_exit=$?
+elif command -v timeout >/dev/null 2>&1; then
+  timeout "$timeout_seconds" "${claude_args[@]}" < "$prompt_path" > "$response_path" 2> "$stderr_path"
+  claude_exit=$?
+else
+  printf 'No python3 or timeout command found; running without a timeout guard.\n' > "$stderr_path"
+  "${claude_args[@]}" < "$prompt_path" > "$response_path" 2>> "$stderr_path"
+  claude_exit=$?
+fi
+set -e
+
+if [[ "$claude_exit" -eq 124 ]] && ! grep -q 'timed out after' "$stderr_path" 2>/dev/null; then
+  printf 'Claude review timed out after %ss.\n' "$timeout_seconds" >> "$stderr_path"
+fi
+
+{
+  printf 'job_id=%s\n' "$job_id"
+  printf 'model=%s\n' "$model"
+  printf 'max_budget_usd=%s\n' "$max_budget_usd"
+  printf 'claude_exit=%s\n' "$claude_exit"
+} > "$worker_log_path"
+
+finish "$claude_exit"
+if [[ "$always_exit_zero" -eq 1 ]]; then
+  exit 0
+fi
+exit "$claude_exit"

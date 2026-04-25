@@ -1,0 +1,13 @@
+{
+  "name": "review-claude",
+  "version": "0.1.0",
+  "description": "Submit asynchronous read-only Claude review jobs and collect their results.",
+  "author": {
+    "name": "Local Workspace"
+  },
+  "keywords": [
+    "code-review",
+    "background-review",
+    "codex"
+  ]
+}

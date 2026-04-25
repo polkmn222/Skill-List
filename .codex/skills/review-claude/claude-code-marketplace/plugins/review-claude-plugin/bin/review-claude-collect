@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  review-claude-collect.sh [job-id|latest] [--summary-dir <dir>]
+
+Prints the mirrored Claude worker summary. If the summary is not present yet,
+it checks the raw /tmp job directory and reports whether the job still looks
+incomplete.
+USAGE
+}
+
+summary_dir="${CLAUDE_REVIEW_SUMMARY_DIR:-${REVIEW_CLAUDE_SUMMARY_DIR:-}}"
+job_id="${1:-latest}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+skill_root() {
+  cd "${script_dir}/../../../.." && pwd
+}
+
+workspace_root() {
+  local root parent grandparent
+
+  root="$(skill_root)"
+  parent="$(dirname "$root")"
+  grandparent="$(dirname "$parent")"
+
+  if [[ "$(basename "$parent")" == "skills" && "$(basename "$grandparent")" == ".codex" ]]; then
+    cd "${root}/../../.." && pwd
+  else
+    printf '%s' "$root"
+  fi
+}
+
+default_summary_dir() {
+  printf '%s/review-claude' "$(workspace_root)"
+}
+
+find_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '%s\n' /usr/bin/python3
+    return 0
+  fi
+
+  return 1
+}
+
+latest_index_job_id() {
+  local index_path="$1"
+  local line python_bin
+
+  line="$(sed -n '1p' "$index_path" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+
+  if [[ "$line" == \{* ]]; then
+    python_bin="$(find_python || true)"
+    if [[ -n "$python_bin" ]]; then
+      "$python_bin" - "$line" <<'PY'
+import json
+import sys
+
+try:
+    print(json.loads(sys.argv[1]).get("job_id", ""))
+except json.JSONDecodeError:
+    print("")
+PY
+      return 0
+    fi
+    printf '%s\n' "$line" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p'
+    return 0
+  fi
+
+  printf '%s\n' "$line"
+}
+
+index_record_line() {
+  local index_path="$1"
+  local requested_job_id="$2"
+  local python_bin
+
+  [[ -f "$index_path" ]] || return 1
+
+  if [[ "$requested_job_id" == "latest" || -z "$requested_job_id" ]]; then
+    sed -n '1p' "$index_path"
+    return 0
+  fi
+
+  python_bin="$(find_python || true)"
+  if [[ -n "$python_bin" ]]; then
+    "$python_bin" - "$index_path" "$requested_job_id" <<'PY'
+import json
+import sys
+
+path, requested = sys.argv[1:3]
+with open(path, encoding="utf-8") as source:
+    for line in source:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                if str(json.loads(stripped).get("job_id", "")) == requested:
+                    print(stripped)
+                    raise SystemExit(0)
+            except json.JSONDecodeError:
+                continue
+        elif stripped == requested:
+            print(stripped)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+    return $?
+  fi
+
+  grep -m 1 "\"job_id\":\"${requested_job_id}\"" "$index_path" 2>/dev/null || grep -m 1 "^${requested_job_id}$" "$index_path" 2>/dev/null
+}
+
+index_record_has_response() {
+  local record_line="$1"
+  local python_bin
+
+  [[ "$record_line" == \{* ]] || return 1
+
+  python_bin="$(find_python || true)"
+  if [[ -n "$python_bin" ]]; then
+    "$python_bin" - "$record_line" <<'PY'
+import json
+import sys
+
+try:
+    record = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+
+if "response" in record or "response_raw" in record:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+    return $?
+  fi
+
+  [[ "$record_line" == *'"response":'* || "$record_line" == *'"response_raw":'* ]]
+}
+
+raw_job_has_terminal_state() {
+  local raw_job_dir="$1"
+
+  [[ -f "${raw_job_dir}/exit_code" || -s "${raw_job_dir}/response.json" ]]
+}
+
+raw_job_should_override_index() {
+  local raw_job_dir="$1"
+  local worker_pid kill_error
+
+  raw_job_has_terminal_state "$raw_job_dir" && return 0
+
+  if [[ -f "${raw_job_dir}/worker_pid" ]]; then
+    worker_pid="$(cat "${raw_job_dir}/worker_pid")"
+    kill_error="${raw_job_dir}/collect_kill_error.log"
+    if kill -0 "$worker_pid" >/dev/null 2> "$kill_error"; then
+      return 1
+    fi
+    if grep -qi 'operation not permitted' "$kill_error" 2>/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+write_raw_job_summary_mirror() {
+  local raw_job_dir="$1"
+  local requested_job_id="$2"
+  local response_file status_file exit_file model_file budget_file worker_log_file
+  local index_path index_tmp cost_path cost_tmp python_bin
+
+  [[ -n "$summary_dir" ]] || return 0
+  [[ -d "$raw_job_dir" ]] || return 0
+
+  response_file="${raw_job_dir}/response.json"
+  status_file="${raw_job_dir}/status"
+  exit_file="${raw_job_dir}/exit_code"
+  model_file="${raw_job_dir}/model"
+  budget_file="${raw_job_dir}/max_budget_usd"
+  worker_log_file="${raw_job_dir}/worker.log"
+  index_path="${summary_dir%/}/latest_job_id.txt"
+  index_tmp="${summary_dir%/}/latest_job_id.txt.tmp.$$"
+  cost_path="${summary_dir%/}/cost.txt"
+  cost_tmp="${summary_dir%/}/cost.txt.tmp.$$"
+  python_bin="$(find_python || true)"
+
+  [[ -n "$python_bin" ]] || return 0
+
+  if "$python_bin" - "$index_path" "$index_tmp" "$cost_path" "$cost_tmp" "$requested_job_id" "$raw_job_dir" "$status_file" "$exit_file" "$model_file" "$budget_file" "$response_file" "$worker_log_file" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+(
+    index_path,
+    index_tmp,
+    cost_path,
+    cost_tmp,
+    job_id,
+    raw_job_dir,
+    status_file,
+    exit_file,
+    model_file,
+    budget_file,
+    response_file,
+    worker_log_file,
+) = sys.argv[1:13]
+
+def read_text(path, default=""):
+    try:
+        with open(path, encoding="utf-8") as source:
+            return source.read().strip()
+    except OSError:
+        return default
+
+def parse_exit(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+def line_job_id(line):
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("{"):
+        try:
+            return str(json.loads(stripped).get("job_id", ""))
+        except json.JSONDecodeError:
+            return ""
+    return stripped
+
+def read_worker_exit(path):
+    for line in read_text(path).splitlines():
+        if line.startswith("claude_exit="):
+            return parse_exit(line.split("=", 1)[1])
+    return None
+
+def response_indicates_success(payload):
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("is_error") is True:
+        return False
+    if payload.get("type") == "result" and payload.get("subtype") == "success":
+        return True
+    if "result" in payload and payload.get("api_error_status") in (None, ""):
+        return True
+    return False
+
+exit_code = parse_exit(read_text(exit_file))
+status = read_text(status_file)
+model = read_text(model_file)
+budget = read_text(budget_file)
+
+response = None
+response_raw = None
+if os.path.exists(response_file) and os.path.getsize(response_file) > 0:
+    raw = open(response_file, encoding="utf-8").read()
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError:
+        response_raw = raw
+
+worker_exit = read_worker_exit(worker_log_file)
+if response_indicates_success(response) or worker_exit == 0:
+    exit_code = 0
+    status = "complete"
+elif not status:
+    status = "complete" if exit_code == 0 else "failed"
+
+record = {
+    "job_id": job_id,
+    "status": status,
+    "exit_code": exit_code,
+    "job_dir": raw_job_dir,
+}
+
+if response is not None:
+    record["response"] = response
+    if isinstance(response, dict):
+        record["cost_usd"] = response.get("total_cost_usd")
+        record["duration_ms"] = response.get("duration_ms")
+        record["session_id"] = response.get("session_id")
+elif response_raw is not None:
+    record["response_raw"] = response_raw
+
+with open(index_tmp, "w", encoding="utf-8") as out:
+    out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as source:
+            for existing in source:
+                if line_job_id(existing) == job_id:
+                    continue
+                if existing.strip():
+                    out.write(existing if existing.endswith("\n") else existing + "\n")
+os.replace(index_tmp, index_path)
+
+if response is not None:
+    cost_record = {
+        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "job_id": job_id,
+        "status": status,
+        "exit_code": exit_code,
+        "model": model,
+        "cost_usd": response.get("total_cost_usd") if isinstance(response, dict) else None,
+        "cost_source": "claude_json.total_cost_usd" if isinstance(response, dict) and response.get("total_cost_usd") is not None else "unavailable",
+        "budget_usd": budget,
+        "duration_ms": response.get("duration_ms") if isinstance(response, dict) else None,
+        "session_id": response.get("session_id") if isinstance(response, dict) else None,
+    }
+
+    def load_existing_cost_records(path):
+        records = []
+        if not os.path.exists(path):
+            return records
+        with open(path, encoding="utf-8") as source:
+            for existing in source:
+                stripped = existing.strip()
+                if not stripped or not stripped.startswith("{"):
+                    continue
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if str(payload.get("job_id", "")) == job_id:
+                    continue
+                records.append(payload)
+        return records
+
+    def write_cost_file(path, records):
+        total = 0.0
+        unavailable = 0
+        for payload in records:
+            value = payload.get("cost_usd")
+            if isinstance(value, (int, float)):
+                total += float(value)
+            else:
+                unavailable += 1
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("# Claude Code review cost log\n")
+            out.write(
+                f"# total_cost_usd=${total:.6f} | entries={len(records)} | "
+                f"unavailable_cost_entries={unavailable}\n"
+            )
+            for payload in records:
+                out.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    write_cost_file(cost_tmp, [cost_record] + load_existing_cost_records(cost_path))
+    os.replace(cost_tmp, cost_path)
+PY
+  then
+    return 0
+  fi
+
+  rm -f "$index_tmp" "$cost_tmp" 2>/dev/null || true
+  return 0
+}
+
+print_response_body() {
+  local response_file="$1"
+  local python_bin
+
+  python_bin="$(find_python || true)"
+  if [[ -n "$python_bin" ]]; then
+    if "$python_bin" - "$response_file" <<'PY' 2>/dev/null
+import json
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8").read()
+payload = json.loads(raw)
+candidate = raw
+if isinstance(payload, dict):
+    candidate = payload.get("result") or payload.get("response") or payload.get("message") or raw
+if isinstance(candidate, (dict, list)):
+    sys.stdout.write(json.dumps(candidate, indent=2, ensure_ascii=False))
+else:
+    sys.stdout.write(str(candidate).rstrip())
+sys.stdout.write("\n")
+PY
+    then
+      return 0
+    fi
+  fi
+
+  sed -n '1,120p' "$response_file"
+}
+
+print_response_summary() {
+  local requested_job_id="$1"
+  local response_file="$2"
+
+  printf '# Claude Worker Result\n\n'
+  printf -- '- Job id: `%s`\n' "$requested_job_id"
+  printf -- '- Response JSON: `%s`\n' "$response_file"
+  printf '\n## Claude Response\n\n'
+  print_response_body "$response_file"
+}
+
+print_index_record_summary() {
+  local record_line="$1"
+  local python_bin
+
+  [[ "$record_line" == \{* ]] || return 1
+  python_bin="$(find_python || true)"
+  [[ -n "$python_bin" ]] || return 1
+
+  "$python_bin" - "$record_line" <<'PY'
+import json
+import sys
+
+record = json.loads(sys.argv[1])
+job_id = record.get("job_id", "")
+response = record.get("response")
+print("# Claude Worker Result\n")
+print(f"- Job id: `{job_id}`")
+print("- Source: `latest_job_id.txt`")
+if record.get("status"):
+    print(f"- Status: `{record.get('status')}`")
+if record.get("exit_code") is not None:
+    print(f"- Exit code: `{record.get('exit_code')}`")
+print("\n## Claude Response\n")
+if isinstance(response, dict):
+    candidate = response.get("result") or response.get("response") or response.get("message") or response
+else:
+    candidate = response
+if isinstance(candidate, (dict, list)):
+    print(json.dumps(candidate, ensure_ascii=False, indent=2))
+elif candidate is None:
+    print("No Claude response JSON is available yet.")
+else:
+    print(str(candidate).rstrip())
+PY
+}
+
+print_raw_job_status() {
+  local raw_job_dir="$1"
+  local requested_job_id="$2"
+
+  if [[ -f "${raw_job_dir}/exit_code" ]]; then
+    write_raw_job_summary_mirror "$raw_job_dir" "$requested_job_id"
+
+    if [[ -s "${raw_job_dir}/response.json" ]]; then
+      print_response_summary "$requested_job_id" "${raw_job_dir}/response.json"
+      return 0
+    fi
+
+    printf 'Claude worker finished but no summary mirror was found.\n'
+    printf -- '- Job id: `%s`\n' "$requested_job_id"
+    printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+    printf -- '- Status: `%s`\n' "$(cat "${raw_job_dir}/status" 2>/dev/null || printf unknown)"
+    printf -- '- Exit code: `%s`\n' "$(cat "${raw_job_dir}/exit_code" 2>/dev/null || printf unknown)"
+    if [[ -s "${raw_job_dir}/stderr.log" ]]; then
+      printf '\n## stderr\n\n```text\n'
+      sed -n '1,120p' "${raw_job_dir}/stderr.log"
+      printf '\n```\n'
+    fi
+    return 0
+  fi
+
+  if [[ -f "${raw_job_dir}/worker_pid" ]]; then
+    worker_pid="$(cat "${raw_job_dir}/worker_pid")"
+    kill_error="${raw_job_dir}/collect_kill_error.log"
+    if kill -0 "$worker_pid" >/dev/null 2> "$kill_error"; then
+      printf 'Claude worker is still running.\n'
+      printf -- '- Job id: `%s`\n' "$requested_job_id"
+      printf -- '- PID: `%s`\n' "$worker_pid"
+      printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+      return 0
+    fi
+    if grep -qi 'operation not permitted' "$kill_error" 2>/dev/null; then
+      printf 'Claude worker appears to be running, but this shell cannot inspect the process.\n'
+      printf -- '- Job id: `%s`\n' "$requested_job_id"
+      printf -- '- PID: `%s`\n' "$worker_pid"
+      printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+      return 0
+    fi
+    printf 'Claude worker is no longer running but did not write an exit code.\n'
+    printf -- '- Job id: `%s`\n' "$requested_job_id"
+    printf -- '- PID: `%s`\n' "$worker_pid"
+    printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+    if [[ -s "${raw_job_dir}/stderr.log" ]]; then
+      printf '\n## stderr\n\n```text\n'
+      sed -n '1,120p' "${raw_job_dir}/stderr.log"
+      printf '\n```\n'
+    fi
+    return 1
+  fi
+
+  if [[ -f "${raw_job_dir}/launchctl_label" ]]; then
+    printf 'Claude worker was submitted via launchctl and is waiting to start.\n'
+    printf -- '- Job id: `%s`\n' "$requested_job_id"
+    printf -- '- Launchctl label: `%s`\n' "$(cat "${raw_job_dir}/launchctl_label")"
+    printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+    return 0
+  fi
+
+  printf 'Claude worker has not completed its contract yet.\n'
+  printf -- '- Job id: `%s`\n' "$requested_job_id"
+  printf -- '- Raw job directory: `%s`\n' "$raw_job_dir"
+  return 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --summary-dir)
+      summary_dir="${2:-}"
+      if [[ -z "$summary_dir" ]]; then
+        echo "Missing value for --summary-dir" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+summary_dir="${summary_dir:-$(default_summary_dir)}"
+
+if [[ "$job_id" == "latest" || -z "$job_id" ]]; then
+  index_path="${summary_dir%/}/latest_job_id.txt"
+  record_line="$(index_record_line "$index_path" latest 2>/dev/null || true)"
+
+  if [[ -n "$record_line" && "$record_line" == \{* ]]; then
+    job_id="$(latest_index_job_id "$index_path")"
+    raw_job_dir="/tmp/review-claude-workers/${job_id}/job"
+    if index_record_has_response "$record_line" || ! raw_job_should_override_index "$raw_job_dir"; then
+      print_index_record_summary "$record_line"
+      exit 0
+    fi
+  elif [[ -f "$index_path" ]]; then
+    job_id="$(latest_index_job_id "$index_path")"
+  else
+    job_id=""
+  fi
+
+  if [[ -n "$job_id" && -d "/tmp/review-claude-workers/${job_id}/job" ]]; then
+    print_raw_job_status "/tmp/review-claude-workers/${job_id}/job" "$job_id"
+    exit $?
+  fi
+
+  if [[ -f "${summary_dir%/}/latest_submitted.md" ]]; then
+    cat "${summary_dir%/}/latest_submitted.md"
+    exit 0
+  fi
+
+  if [[ -f "${summary_dir%/}/latest.md" ]]; then
+    cat "${summary_dir%/}/latest.md"
+    exit 0
+  fi
+  printf 'No latest review-claude summary found in %s\n' "$summary_dir" >&2
+  exit 1
+fi
+
+index_path="${summary_dir%/}/latest_job_id.txt"
+record_line="$(index_record_line "$index_path" "$job_id" 2>/dev/null || true)"
+raw_job_dir="/tmp/review-claude-workers/${job_id}/job"
+if [[ -n "$record_line" && "$record_line" == \{* ]]; then
+  if index_record_has_response "$record_line" || ! raw_job_should_override_index "$raw_job_dir"; then
+    print_index_record_summary "$record_line"
+    exit 0
+  fi
+fi
+
+if [[ -d "$raw_job_dir" ]]; then
+  print_raw_job_status "$raw_job_dir" "$job_id"
+  exit $?
+fi
+
+printf 'No review-claude job found for %s\n' "$job_id" >&2
+printf 'Checked summary directory: %s\n' "$summary_dir" >&2
+exit 1

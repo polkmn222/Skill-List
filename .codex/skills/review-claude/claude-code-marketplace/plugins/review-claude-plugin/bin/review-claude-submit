@@ -1,0 +1,608 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  review-claude-submit.sh [options] [focus text...]
+
+Options:
+  --base <ref>                 Git ref to diff against. Default: HEAD.
+  --backend <mode>             auto, nohup, or launchctl. Default: auto.
+  --summary-dir <dir>          Directory where mirrored summaries are written.
+  --model <name>               Claude model alias. Default: sonnet.
+  --max-budget-usd <amount>    Claude budget cap. Default: 0.25.
+  --timeout-seconds <seconds>  Worker timeout. Default: 120.
+  --notify 0|1                 Try a macOS notification. Default: 1.
+  --env-file <file>            Read only ANTHROPIC_API_KEY from this file.
+  --include-untracked          Mark untracked files intent-to-add before diffing.
+  --allow-secret-like-diff     Submit even if the diff matches secret-like text.
+  --dry-run                    Build job files but do not submit Claude.
+  --help                       Show this help.
+
+Submits a read-only Claude Code review job and returns immediately. The worker
+continues in the background and mirrors results to the summary directory.
+The submitter copies only ANTHROPIC_API_KEY into a locked-down runtime file,
+then the worker deletes that file immediately after reading it.
+
+Project context is included by default from AGENTS.md, README.md, and docs/
+under the workspace root. Context is advisory only; Claude is still instructed
+to report findings against the diff under review.
+USAGE
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+worker_source="${script_dir}/claude-review-worker.sh"
+if [[ ! -f "$worker_source" && -f "${script_dir}/claude-review-worker" ]]; then
+  worker_source="${script_dir}/claude-review-worker"
+fi
+
+base_ref="${CLAUDE_REVIEW_BASE:-HEAD}"
+summary_dir="${CLAUDE_REVIEW_SUMMARY_DIR:-${REVIEW_CLAUDE_SUMMARY_DIR:-}}"
+backend_mode="${CLAUDE_REVIEW_BACKEND:-auto}"
+model="${CLAUDE_REVIEW_MODEL:-sonnet}"
+max_budget_usd="${CLAUDE_REVIEW_MAX_BUDGET_USD:-0.25}"
+timeout_seconds="${CLAUDE_REVIEW_TIMEOUT_SECONDS:-120}"
+notify="${CLAUDE_REVIEW_NOTIFY:-1}"
+env_file=""
+include_untracked=0
+allow_secret_like_diff=0
+dry_run=0
+focus_parts=()
+secret_like_pattern='(AKIA[0-9A-Z]{16}|BEGIN (RSA|OPENSSH|PRIVATE) KEY|ANTHROPIC_API_KEY[[:space:]]*=|OPENAI_API_KEY[[:space:]]*=|api[_-]?key[[:space:]]*[:=]|password[[:space:]]*[:=]|secret[[:space:]]*[:=])'
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+read_anthropic_key_from_env_file() {
+  local file_path="$1"
+  local line key value first_char last_char
+
+  [[ -r "$file_path" ]] || return 13
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim_whitespace "$line")"
+
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="$(trim_whitespace "$line")"
+    fi
+
+    [[ "$line" == *=* ]] || continue
+
+    key="$(trim_whitespace "${line%%=*}")"
+    value="$(trim_whitespace "${line#*=}")"
+
+    [[ "$key" == "ANTHROPIC_API_KEY" ]] || continue
+
+    if [[ "${#value}" -ge 2 ]]; then
+      first_char="${value:0:1}"
+      last_char="${value: -1}"
+      if [[ "$first_char" == "$last_char" && ( "$first_char" == "\"" || "$first_char" == "'" ) ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    printf '%s' "$value"
+    return 0
+  done < "$file_path"
+
+  return 1
+}
+
+skill_root() {
+  cd "${script_dir}/../../../.." && pwd
+}
+
+workspace_root() {
+  local root parent grandparent
+
+  root="$(skill_root)"
+  parent="$(dirname "$root")"
+  grandparent="$(dirname "$parent")"
+
+  if [[ "$(basename "$parent")" == "skills" && "$(basename "$grandparent")" == ".codex" ]]; then
+    cd "${root}/../../.." && pwd
+  else
+    printf '%s' "$root"
+  fi
+}
+
+default_summary_dir() {
+  printf '%s/review-claude' "$(workspace_root)"
+}
+
+default_env_file() {
+  printf '%s/.env' "$(workspace_root)"
+}
+
+resolve_path() {
+  local path="$1"
+  local dir base
+
+  base="$(basename "$path")"
+  dir="$(cd "$(dirname "$path")" && pwd -P)" || return 1
+  printf '%s/%s' "$dir" "$base"
+}
+
+ensure_allowed_env_file() {
+  local requested="$1"
+  local expected resolved_requested resolved_expected
+
+  expected="$(default_env_file)"
+  resolved_requested="$(resolve_path "$requested")" || return 1
+  resolved_expected="$(resolve_path "$expected")" || return 1
+  [[ "$resolved_requested" == "$resolved_expected" ]]
+}
+
+should_use_launchctl() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+
+  case "$backend_mode" in
+    launchctl)
+      return 0
+      ;;
+    nohup)
+      return 1
+      ;;
+    auto)
+      return 0
+      ;;
+    *)
+      printf 'Unknown backend mode: %s\n' "$backend_mode" >&2
+      exit 2
+      ;;
+  esac
+}
+
+safe_component() {
+  local value="$1"
+  value="${value// /-}"
+  value="$(printf '%s' "$value" | tr -cd '[:alnum:]._-' )"
+  if [[ -z "$value" ]]; then
+    value="repo"
+  fi
+  printf '%s' "$value"
+}
+
+find_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '%s\n' /usr/bin/python3
+    return 0
+  fi
+
+  return 1
+}
+
+context_root() {
+  if [[ -n "${CLAUDE_REVIEW_CONTEXT_ROOT:-}" ]]; then
+    printf '%s' "$CLAUDE_REVIEW_CONTEXT_ROOT"
+  else
+    workspace_root
+  fi
+}
+
+context_relative_path() {
+  local root="$1"
+  local file_path="$2"
+
+  case "$file_path" in
+    "$root"/*)
+      printf '%s' "${file_path#"$root"/}"
+      ;;
+    *)
+      basename "$file_path"
+      ;;
+  esac
+}
+
+write_context_file() {
+  local root="$1"
+  local file_path="$2"
+  local relative_path size_bytes
+
+  [[ -f "$file_path" ]] || return 0
+
+  size_bytes="$(wc -c < "$file_path" | tr -d '[:space:]')"
+  if [[ "$size_bytes" =~ ^[0-9]+$ && "$size_bytes" -gt 65536 ]]; then
+    return 0
+  fi
+
+  if [[ "$allow_secret_like_diff" -eq 0 ]] && grep -Eiq "$secret_like_pattern" "$file_path"; then
+    {
+      printf 'Context file contains secret-like text: %s\n' "$file_path"
+      printf 'Use --allow-secret-like-diff only after confirming no real secret is present.\n'
+    } >&2
+    exit 4
+  fi
+
+  relative_path="$(context_relative_path "$root" "$file_path")"
+  printf '\n### %s\n\n' "$relative_path"
+  printf '````text\n'
+  sed -n '1,1200p' "$file_path"
+  printf '\n````\n'
+}
+
+write_project_context() {
+  local root docs_dir file has_context=0
+
+  root="$(resolve_path "$(context_root)")" || return 0
+
+  if [[ -f "${root}/AGENTS.md" || -f "${root}/README.md" || -d "${root}/docs" ]]; then
+    has_context=1
+  fi
+  [[ "$has_context" -eq 1 ]] || return 0
+
+  printf '## Project Context\n\n'
+  printf 'Use the following files only as project context. Do not report findings against context files unless they are also part of the diff under review.\n'
+
+  write_context_file "$root" "${root}/AGENTS.md"
+  write_context_file "$root" "${root}/README.md"
+
+  docs_dir="${root}/docs"
+  if [[ -d "$docs_dir" ]]; then
+    while IFS= read -r file; do
+      write_context_file "$root" "$file"
+    done < <(find "$docs_dir" -type f \( -name '*.md' -o -name '*.markdown' -o -name '*.txt' \) -print | sort)
+  fi
+
+  printf '\n'
+}
+
+write_latest_submission() {
+  local index_path tmp_path submitted_at python_bin
+
+  index_path="${summary_dir%/}/latest_job_id.txt"
+  tmp_path="${summary_dir%/}/latest_job_id.txt.tmp.$$"
+  submitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python_bin="$(find_python || true)"
+
+  if [[ -n "$python_bin" ]]; then
+    "$python_bin" - "$index_path" "$tmp_path" "$job_id" "$job_dir" "$backend" "$submitted_at" <<'PY'
+import json
+import os
+import sys
+
+index_path, tmp_path, job_id, job_dir, backend, submitted_at = sys.argv[1:7]
+record = {
+    "job_id": job_id,
+    "status": "submitted",
+    "job_dir": job_dir,
+    "backend": backend,
+    "submitted_at": submitted_at,
+}
+
+def line_job_id(line):
+    line = line.strip()
+    if not line:
+        return ""
+    if line.startswith("{"):
+        try:
+            payload = json.loads(line)
+            return str(payload.get("job_id", ""))
+        except json.JSONDecodeError:
+            return ""
+    return line
+
+with open(tmp_path, "w", encoding="utf-8") as out:
+    out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as source:
+            for existing in source:
+                if line_job_id(existing) == job_id:
+                    continue
+                if existing.strip():
+                    out.write(existing if existing.endswith("\n") else existing + "\n")
+
+os.replace(tmp_path, index_path)
+PY
+    return 0
+  fi
+
+  {
+    printf '{"job_id":"%s","status":"submitted","job_dir":"%s","backend":"%s","submitted_at":"%s"}\n' "$job_id" "$job_dir" "$backend" "$submitted_at"
+    if [[ -f "$index_path" ]]; then
+      sed "/$job_id/d" "$index_path"
+    fi
+  } > "$tmp_path"
+  mv "$tmp_path" "$index_path"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)
+      base_ref="${2:-}"
+      if [[ -z "$base_ref" ]]; then
+        echo "Missing value for --base" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --backend)
+      backend_mode="${2:-}"
+      if [[ -z "$backend_mode" ]]; then
+        echo "Missing value for --backend" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --summary-dir)
+      summary_dir="${2:-}"
+      if [[ -z "$summary_dir" ]]; then
+        echo "Missing value for --summary-dir" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --model)
+      model="${2:-}"
+      if [[ -z "$model" ]]; then
+        echo "Missing value for --model" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --max-budget-usd)
+      max_budget_usd="${2:-}"
+      if [[ -z "$max_budget_usd" ]]; then
+        echo "Missing value for --max-budget-usd" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --timeout-seconds)
+      timeout_seconds="${2:-}"
+      if [[ -z "$timeout_seconds" ]]; then
+        echo "Missing value for --timeout-seconds" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --notify)
+      notify="${2:-}"
+      if [[ -z "$notify" ]]; then
+        echo "Missing value for --notify" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --env-file)
+      env_file="${2:-}"
+      if [[ -z "$env_file" ]]; then
+        echo "Missing value for --env-file" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --include-untracked)
+      include_untracked=1
+      shift
+      ;;
+    --allow-secret-like-diff)
+      allow_secret_like_diff=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        focus_parts+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      focus_parts+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ! -f "$worker_source" ]]; then
+  echo "Could not find claude-review-worker beside submit script." >&2
+  exit 2
+fi
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "review-claude-submit must be run inside a git repository." >&2
+  exit 2
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+repo_name="$(safe_component "$(basename "$repo_root")")"
+summary_dir="${summary_dir:-$(default_summary_dir)}"
+env_file="${env_file:-$(default_env_file)}"
+
+if ! ensure_allowed_env_file "$env_file"; then
+  printf 'review-claude-submit only reads ANTHROPIC_API_KEY from %s\n' "$(default_env_file)" >&2
+  exit 2
+fi
+
+job_id="claude-$(date +%Y%m%d-%H%M%S)-${repo_name}-$$"
+runtime_dir="/tmp/review-claude-workers/${job_id}"
+job_dir="${runtime_dir}/job"
+runtime_worker="${runtime_dir}/claude-review-worker.sh"
+focus_text="${focus_parts[*]:-}"
+
+umask 077
+mkdir -p "$job_dir" "$summary_dir" "$runtime_dir"
+
+if [[ "$include_untracked" -eq 1 ]]; then
+  while IFS= read -r -d '' path; do
+    git -C "$repo_root" add -N -- "$path"
+  done < <(git -C "$repo_root" ls-files --others --exclude-standard -z)
+fi
+
+if ! git -C "$repo_root" rev-parse --verify --quiet "$base_ref" >/dev/null; then
+  printf 'Base ref not found: %s\n' "$base_ref" >&2
+  exit 2
+fi
+
+git -C "$repo_root" diff --no-ext-diff --binary "$base_ref" > "${job_dir}/diff.patch"
+
+if [[ ! -s "${job_dir}/diff.patch" ]]; then
+  printf 'No diff to review against %s.\n' "$base_ref" >&2
+  exit 3
+fi
+
+if [[ "$allow_secret_like_diff" -eq 0 ]] && grep -Eiq "$secret_like_pattern" "${job_dir}/diff.patch"; then
+  {
+    echo "Diff contains secret-like text. Review the diff before sending it to Claude."
+    echo "Use --allow-secret-like-diff only after confirming no real secret is present."
+    echo "Job files were left at: ${job_dir}"
+  } >&2
+  exit 4
+fi
+
+{
+  printf 'You are Claude Code running as a read-only second reviewer for Codex.\n'
+  printf 'Review only the diff below. Do not edit files or suggest applying patches yourself.\n'
+  printf 'Prioritize correctness, security, data loss, reliability, and regressions.\n'
+  printf 'Ignore purely stylistic issues unless they hide a real bug.\n\n'
+  printf 'Return findings ordered by severity. Each finding must include:\n'
+  printf -- '- severity\n'
+  printf -- '- file and line if available\n'
+  printf -- '- why it matters\n'
+  printf -- '- concrete suggested fix\n\n'
+  printf 'If there are no material findings, say that clearly.\n\n'
+  printf 'Repository: %s\n' "$repo_root"
+  printf 'Base ref: %s\n' "$base_ref"
+  if [[ -n "$focus_text" ]]; then
+    printf 'Reviewer focus: %s\n' "$focus_text"
+  fi
+  printf '\n'
+  write_project_context
+  printf '## Diff Under Review\n\n'
+  printf '```diff\n'
+  sed -n '1,$p' "${job_dir}/diff.patch"
+  printf '\n```\n'
+} > "${job_dir}/prompt.txt"
+
+cp "$worker_source" "$runtime_worker"
+chmod +x "$runtime_worker"
+xattr -c "$runtime_worker" 2>/dev/null || true
+
+printf '%s\n' "$repo_root" > "${job_dir}/repo_root"
+printf '%s\n' "$base_ref" > "${job_dir}/base_ref"
+printf '%s\n' "$summary_dir" > "${job_dir}/summary_dir"
+printf '%s\n' "$runtime_dir" > "${job_dir}/runtime_dir"
+
+if [[ "$dry_run" -eq 1 ]]; then
+  cat <<EOF
+review-claude dry run prepared
+job_id=${job_id}
+job_dir=${job_dir}
+summary_dir=${summary_dir}
+env_file=${env_file}
+prompt=${job_dir}/prompt.txt
+diff=${job_dir}/diff.patch
+backend=dry-run
+EOF
+  exit 0
+fi
+
+anthropic_key="${ANTHROPIC_API_KEY:-}"
+if [[ -z "$anthropic_key" ]]; then
+  if ! anthropic_key="$(read_anthropic_key_from_env_file "$env_file")"; then
+    printf 'Could not read ANTHROPIC_API_KEY from env file: %s\n' "$env_file" >&2
+    exit 13
+  fi
+fi
+
+claude_bin="${CLAUDE_REVIEW_CLAUDE_BIN:-}"
+if [[ -z "$claude_bin" ]]; then
+  claude_bin="$(command -v claude || true)"
+fi
+if [[ -z "$claude_bin" ]]; then
+  echo "claude CLI was not found on PATH." >&2
+  exit 127
+fi
+
+label="ai.codex.review-claude.${job_id}"
+backend="nohup"
+launchctl_submit_stderr="${job_dir}/launchctl_submit_stderr.log"
+key_file="${runtime_dir}/anthropic.env"
+
+printf 'ANTHROPIC_API_KEY=%s\n' "$anthropic_key" > "$key_file"
+
+worker_args=(
+  "$job_dir" "$job_id"
+  --model "$model"
+  --claude-bin "$claude_bin"
+  --max-budget-usd "$max_budget_usd"
+  --timeout-seconds "$timeout_seconds"
+  --notify "$notify"
+  --env-file "$key_file"
+  --delete-env-file-after-read
+  --summary-dir "$summary_dir"
+)
+
+start_worker_nohup() {
+  nohup /bin/bash "$runtime_worker" \
+    "${worker_args[@]}" \
+    > "${job_dir}/worker.out" \
+    2> "${job_dir}/worker.err" &
+  printf '%s\n' "$!" > "${job_dir}/launcher_pid"
+}
+
+if should_use_launchctl; then
+  set +e
+  launchctl submit \
+    -l "$label" \
+    -o "${job_dir}/worker.out" \
+    -e "${job_dir}/worker.err" \
+    -- /bin/bash "$runtime_worker" \
+      "${worker_args[@]}" \
+      --always-exit-zero \
+      --launchctl-label "$label" \
+      2> "$launchctl_submit_stderr"
+  launchctl_exit=$?
+  set -e
+
+  if [[ "$launchctl_exit" -eq 0 ]]; then
+    backend="launchctl"
+    printf '%s\n' "$label" > "${job_dir}/launchctl_label"
+  else
+    printf '%s\n' "$launchctl_exit" > "${job_dir}/launchctl_submit_exit_code"
+    start_worker_nohup
+  fi
+else
+  start_worker_nohup
+fi
+
+if [[ "$backend" != "launchctl" ]]; then
+  write_latest_submission
+fi
+
+cat <<EOF
+review-claude job submitted
+job_id=${job_id}
+job_dir=${job_dir}
+summary_dir=${summary_dir}
+backend=${backend}
+collect=review-claude-collect ${job_id} --summary-dir "${summary_dir}"
+EOF
